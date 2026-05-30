@@ -1,0 +1,15 @@
+{
+  "name": "amazon-affiliate-agent",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "start": "node gemini-code-1780157735698.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "cors": "^2.8.5",
+    "node-cron": "^3.0.3",
+    "node-fetch": "^3.3.2",
+    "dotenv": "^16.4.5"
+  }
+}
