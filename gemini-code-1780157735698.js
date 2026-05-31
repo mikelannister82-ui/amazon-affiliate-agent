@@ -56,7 +56,7 @@ async function askClaude(systemPrompt, userPrompt, useWebSearch = false) {
   if (!res.ok) throw new Error(`Claude API error: ${res.status}`);
   const data = await res.json();
   const text = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('');
-  return text.replace(/`{3}json|`{3}/g, '').trim();
+  return text.split('```json').join('').split('```').join('').trim();
 }
 
 // ─── EVOLVED SYSTEM PROMPTS FOR CONTINUOUS ANALYSIS ─────────────────────────
