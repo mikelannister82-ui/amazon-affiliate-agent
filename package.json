@@ -1,18 +1,245 @@
-{
-  "name": "amazon-affiliate-agent",
-  "version": "1.0.0",
-  "private": true,
-  "scripts": {
-    "start": "node gemini-code-1780157735698.js"
-  },
-  "dependencies": {
-    "express": "^4.21.0",
-    "cors": "^2.8.5",
-    "node-cron": "^3.0.3",
-    "node-fetch": "^3.3.2",
-    "dotenv": "^16.4.5"
-  },
-  "engines": {
-    "node": ">=18"
+// =============================================
+// AFFILIATE AGENT — SECURE BACKEND SERVER
+// File: affiliate-backend.js
+//
+// This Node.js server:
+//  1. Proxies Claude API calls (keeps your key secret)
+//  2. Runs an autonomous agent on a schedule
+//  3. Caches results to save API costs
+//  4. Serves the widget endpoint your site calls
+//
+// DEPLOY TO: Railway, Render, Vercel, or any VPS
+// =============================================
+
+const express    = require('express');
+const cors       = require('cors');
+const cron       = require('node-cron');
+const fetch      = (...args) => import('node-fetch').then(m => m.default(...args));
+require('dotenv').config();
+
+const app  = express();
+const PORT = process.env.PORT || 3001;
+
+app.use(cors({ origin: process.env.ALLOWED_ORIGIN || '*' }));
+app.use(express.json());
+
+// ─── IN-MEMORY CACHE ────────────────────────────────────────────────────────
+// In production swap this for Redis or a DB
+const cache = {
+  trendingProducts: null,
+  trendingUpdatedAt: null,
+  seasonalTrends: null,
+  trendsUpdatedAt: null,
+  weeklyStrategy: null,
+  strategyUpdatedAt: null
+};
+
+// ─── CLAUDE API HELPER ──────────────────────────────────────────────────────
+async function askClaude(systemPrompt, userPrompt, useWebSearch = false) {
+  const body = {
+    model: 'claude-sonnet-4-20250514',
+    max_tokens: 1000,
+    system: systemPrompt,
+    messages: [{ role: 'user', content: userPrompt }]
+  };
+
+  if (useWebSearch) {
+    body.tools = [{ type: 'web_search_20250305', name: 'web_search' }];
   }
+
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': process.env.ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01'
+    },
+    body: JSON.stringify(body)
+  });
+
+  if (!res.ok) throw new Error(`Claude API error: ${res.status}`);
+  const data = await res.json();
+  const text = (data.content || []).filter(b => b.type === 'text').map(b => b.text).join('');
+  return text.replace(/```json|```/g, '').trim();
 }
+
+// ─── SYSTEM PROMPTS ─────────────────────────────────────────────────────────
+const SYSTEM_PROMPTS = {
+  scout: `You are an elite affiliate product scout. Find the BEST trending products to promote right now.
+Respond ONLY in JSON (no markdown fences):
+{"topProducts":[{"name":"string","niche":"string","commission":"string","program":"string","conversion":"High|Med|Low","whyTrending":"string","angle":"string","audience":"string"}],"quickWin":"string","insight":"string","platforms":["string"]}`,
+
+  page: `You are a world-class direct response copywriter. Generate affiliate landing page copy.
+Respond ONLY in JSON (no markdown fences):
+{"headline":"string","subheadline":"string","cta":"string","urgency":"string","painPoints":["string"],"benefits":["string"],"emailSubject":"string","twitterHook":"string","tiktokHook":"string","seoKeywords":["string"]}`,
+
+  strategy: `You are a self-made affiliate millionaire mentor. Give a no-fluff $0 to $5K monthly plan.
+Respond ONLY in JSON (no markdown fences):
+{"phase":"string","weeks":[{"week":1,"goal":"string","actions":["string"],"revenue":"string"},{"week":2,"goal":"string","actions":["string"],"revenue":"string"},{"week":3,"goal":"string","actions":["string"],"revenue":"string"},{"week":4,"goal":"string","actions":["string"],"revenue":"string"}],"trafficSources":[{"platform":"string","strategy":"string","timeToResults":"string"}],"proTip":"string","mistakes":["string"]}`,
+
+  trends: `You are a trend analyst for affiliate marketers. Identify seasonal buying opportunities.
+Respond ONLY in JSON (no markdown fences):
+{"season":"string","hotCategories":[{"name":"string","direction":"↑ Rising|↓ Falling|→ Stable","commission":"string","urgency":"Act Now|Plan Ahead|Monitor"}],"upcomingEvents":[{"event":"string","daysAway":0,"opportunity":"string"}],"goldMine":"string","avoid":["string"]}`
+};
+
+// ─── ROUTES ─────────────────────────────────────────────────────────────────
+
+// Health check
+app.get('/health', (req, res) => res.json({ status: 'ok', timestamp: new Date() }));
+
+// Main widget endpoint (called by your site's JS)
+app.post('/api/affiliate-agent', async (req, res) => {
+  const { agent, prompt, systemPrompt } = req.body;
+  if (!prompt) return res.status(400).json({ error: 'prompt required' });
+
+  const sys = SYSTEM_PROMPTS[agent] || systemPrompt;
+  if (!sys) return res.status(400).json({ error: 'unknown agent' });
+
+  try {
+    const result = await askClaude(sys, prompt, true);
+    res.json({ result, agent, timestamp: new Date() });
+  } catch (err) {
+    console.error('Agent error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get cached auto-run results (your site can poll or display these)
+app.get('/api/auto-results', (req, res) => {
+  res.json({
+    trendingProducts: cache.trendingProducts,
+    seasonalTrends:   cache.seasonalTrends,
+    weeklyStrategy:   cache.weeklyStrategy,
+    updatedAt: {
+      products: cache.trendingUpdatedAt,
+      trends:   cache.trendsUpdatedAt,
+      strategy: cache.strategyUpdatedAt
+    }
+  });
+});
+
+// Serve cached trending products (for embedding in your product pages)
+app.get('/api/trending', (req, res) => {
+  if (!cache.trendingProducts) return res.json({ message: 'Not yet fetched. Agent runs at 6am daily.' });
+  res.json(cache.trendingProducts);
+});
+
+// Manually trigger all agents (call this from a cron job or webhook)
+app.post('/api/trigger', async (req, res) => {
+  const secret = req.headers['x-agent-secret'];
+  if (secret !== process.env.AGENT_SECRET) return res.status(401).json({ error: 'unauthorized' });
+  console.log('Manual trigger received');
+  runAllAgents();
+  res.json({ message: 'Agents triggered', timestamp: new Date() });
+});
+
+// Webhook endpoint — connect to Zapier, Make.com, or your site CMS
+// This can auto-post trending products to your blog or email list
+app.post('/api/webhook', async (req, res) => {
+  const { event, data } = req.body;
+  console.log('Webhook received:', event, data);
+
+  // Auto-generate copy for a new product they want to promote
+  if (event === 'new_product') {
+    try {
+      const result = await askClaude(SYSTEM_PROMPTS.page, `Create a landing page for: ${data.productName}`);
+      const parsed = JSON.parse(result);
+      // Here you could: post to your CMS, send to Mailchimp, etc.
+      console.log('Generated page copy for:', data.productName);
+      res.json({ success: true, page: parsed });
+    } catch(err) {
+      res.status(500).json({ error: err.message });
+    }
+    return;
+  }
+
+  res.json({ received: true });
+});
+
+// ─── AUTONOMOUS SCHEDULED AGENTS ────────────────────────────────────────────
+// These run on their own — no button clicking required
+
+async function runAllAgents() {
+  const now = new Date().toISOString();
+  console.log(`\n🤖 [${now}] Autonomous agent cycle starting...`);
+
+  // 1. Scout trending products
+  try {
+    console.log('🔥 Scouting trending products...');
+    const month = new Date().toLocaleString('default', { month: 'long' });
+    const raw = await askClaude(
+      SYSTEM_PROMPTS.scout,
+      `Find the absolute best affiliate products to promote in ${month}. Focus on high commission and low competition.`,
+      true
+    );
+    cache.trendingProducts    = JSON.parse(raw);
+    cache.trendingUpdatedAt   = now;
+    console.log(`✅ Found ${cache.trendingProducts?.topProducts?.length || 0} products`);
+  } catch (err) { console.error('Scout error:', err.message); }
+
+  // 2. Analyze seasonal trends
+  try {
+    console.log('🌊 Analyzing seasonal trends...');
+    const raw = await askClaude(
+      SYSTEM_PROMPTS.trends,
+      'What are the biggest affiliate marketing opportunities RIGHT NOW based on current season and upcoming events?',
+      true
+    );
+    cache.seasonalTrends    = JSON.parse(raw);
+    cache.trendsUpdatedAt   = now;
+    console.log('✅ Trends analyzed');
+  } catch (err) { console.error('Trends error:', err.message); }
+
+  // 3. Refresh weekly strategy (runs Mondays only, see cron below)
+  console.log('✅ Autonomous cycle complete\n');
+}
+
+// ─── CRON SCHEDULES ─────────────────────────────────────────────────────────
+
+// Every day at 6:00 AM — scout trending products
+cron.schedule('0 6 * * *', () => {
+  console.log('⏰ Daily product scout triggered');
+  runAllAgents();
+});
+
+// Every Monday at 7:00 AM — refresh weekly strategy
+cron.schedule('0 7 * * 1', async () => {
+  console.log('⏰ Weekly strategy refresh triggered');
+  try {
+    const raw = await askClaude(
+      SYSTEM_PROMPTS.strategy,
+      'Generate a fresh 4-week affiliate marketing roadmap for someone at the $0-$1K stage, targeting $5K/month.',
+      false
+    );
+    cache.weeklyStrategy      = JSON.parse(raw);
+    cache.strategyUpdatedAt   = new Date().toISOString();
+    console.log('✅ Weekly strategy refreshed');
+  } catch(err) { console.error('Strategy error:', err.message); }
+});
+
+// Every Sunday at 8:00 PM — prep for upcoming week / upcoming holidays
+cron.schedule('0 20 * * 0', async () => {
+  console.log('⏰ Sunday prep scan triggered');
+  try {
+    const raw = await askClaude(
+      SYSTEM_PROMPTS.trends,
+      'What events, holidays, or seasonal moments are coming up in the next 2-4 weeks that I should start promoting products for NOW?',
+      true
+    );
+    // You could email yourself this or post to Slack, Discord, etc.
+    console.log('📅 Upcoming opportunities:', JSON.parse(raw));
+  } catch(err) { console.error('Sunday prep error:', err.message); }
+});
+
+// ─── START SERVER ────────────────────────────────────────────────────────────
+app.listen(PORT, () => {
+  console.log(`\n🚀 Affiliate Agent Backend running on port ${PORT}`);
+  console.log(`   POST /api/affiliate-agent  ← widget calls this`);
+  console.log(`   GET  /api/auto-results     ← cached agent output`);
+  console.log(`   GET  /api/trending         ← latest trending products`);
+  console.log(`   POST /api/trigger          ← manual trigger (needs secret)`);
+  console.log(`   POST /api/webhook          ← Zapier / Make.com integration\n`);
+  console.log('Running first agent cycle in 5 seconds...');
+  setTimeout(runAllAgents, 5000);
+});
+
